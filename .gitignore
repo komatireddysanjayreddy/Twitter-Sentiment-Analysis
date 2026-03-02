@@ -1,0 +1,36 @@
+# Environment
+.env
+.env.local
+.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.eggs/
+
+# Spark
+/tmp/
+spark-checkpoints/
+derby.log
+metastore_db/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+.vercel/
+
+# Docker
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
