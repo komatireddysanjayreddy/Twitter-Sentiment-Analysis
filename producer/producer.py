@@ -1,5 +1,6 @@
 """
-producer.py — Robust Twitter ingestion with automatic mock fallback.
+producer.py — Robust Twitter ingestion with automatic mock fallback
+              and per-hashtag rotation logic.
 
 Strategy:
   1. Attempt live TwitterAPI.io WebSocket stream.
@@ -9,12 +10,20 @@ Strategy:
      If it succeeds, flip back to LIVE automatically.
   4. A heartbeat file is touched every HEARTBEAT_INTERVAL tweets so the
      Docker healthcheck and monitor.py can detect a stalled producer.
+  5. ROTATION LOGIC: every ~30 s the live stream checks which keywords have
+     gone silent for >= ROTATION_IDLE_SECS.  Silent keywords are swapped out
+     for the next candidate in BACKUP_KEYWORDS and the WebSocket reconnects
+     with the updated subscription — keeping the dashboard live even when a
+     topic falls off Twitter's trending list.
 
 Environment variables:
   TWITTER_API_KEY           — TwitterAPI.io key (optional; triggers mock if absent)
   KAFKA_BOOTSTRAP_SERVERS   — default: localhost:9092
   KAFKA_TOPIC               — default: tweets
-  SEARCH_KEYWORDS           — comma-separated, default: python,ai,technology
+  SEARCH_KEYWORDS           — comma-separated starting keywords
+                              default: python,ai,technology,AIRevolution,Bitcoin,BreakingNews
+  BACKUP_KEYWORDS           — comma-separated rotation pool
+  ROTATION_IDLE_SECS        — silence threshold before a keyword is rotated out (default: 60)
   MOCK_RATE                 — synthetic tweets/sec in fallback (default: 1)
   LIVE_FAIL_THRESHOLD       — consecutive failures before mock (default: 3)
   RETRY_LIVE_INTERVAL       — seconds between live-API retry attempts (default: 300)
@@ -49,7 +58,16 @@ logger = logging.getLogger("producer")
 TWITTER_API_KEY         = os.getenv("TWITTER_API_KEY", "")
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 KAFKA_TOPIC             = os.getenv("KAFKA_TOPIC", "tweets")
-SEARCH_KEYWORDS         = os.getenv("SEARCH_KEYWORDS", "python,ai,technology").split(",")
+SEARCH_KEYWORDS         = os.getenv(
+    "SEARCH_KEYWORDS",
+    "python,ai,technology,AIRevolution,Bitcoin,BreakingNews",
+).split(",")
+BACKUP_KEYWORDS         = [kw.strip() for kw in os.getenv(
+    "BACKUP_KEYWORDS",
+    "ChatGPT,MachineLearning,Ethereum,DataScience,OpenAI,"
+    "CyberSecurity,TechNews,Crypto,DevOps,Startup,ClimateChange,SpaceX",
+).split(",")]
+ROTATION_IDLE_SECS      = int(os.getenv("ROTATION_IDLE_SECS", "60"))
 MOCK_RATE               = float(os.getenv("MOCK_RATE", "1"))
 LIVE_FAIL_THRESHOLD     = int(os.getenv("LIVE_FAIL_THRESHOLD", "3"))
 RETRY_LIVE_INTERVAL     = int(os.getenv("RETRY_LIVE_INTERVAL", "300"))
@@ -59,10 +77,16 @@ HEARTBEAT_INTERVAL      = int(os.getenv("HEARTBEAT_INTERVAL", "10"))
 WS_URL = f"wss://api.twitterapi.io/twitter/tweet/websocket?apiKey={TWITTER_API_KEY}"
 
 # ─── Session state ────────────────────────────────────────────────────────────
-_published_count = 0
-_live_fail_count = 0
-_in_mock_mode    = False
-_recent_ids: deque = deque(maxlen=2000)   # sliding dedup ring-buffer
+_published_count    = 0
+_live_fail_count    = 0
+_in_mock_mode       = False
+_recent_ids: deque  = deque(maxlen=2000)   # sliding dedup ring-buffer
+
+# Rotation state
+_active_keywords: list  = []    # mutable copy of SEARCH_KEYWORDS; rotated at runtime
+_keyword_last_seen: dict = {}   # keyword -> unix timestamp of last matching tweet
+_backup_cursor: int     = 0    # cycling index into BACKUP_KEYWORDS
+_rotation_triggered     = False # set by run_live(); read by orchestrate()
 
 # ─── Heartbeat ────────────────────────────────────────────────────────────────
 def _write_heartbeat() -> None:
@@ -71,6 +95,64 @@ def _write_heartbeat() -> None:
             f.write(str(time.time()))
     except OSError:
         pass   # non-fatal
+
+
+# ─── Keyword rotation helpers ─────────────────────────────────────────────────
+def _init_keyword_timestamps() -> None:
+    """Seed last-seen timestamps to now so rotation isn't triggered on fresh connect."""
+    now = time.time()
+    for kw in _active_keywords:
+        _keyword_last_seen.setdefault(kw, now)
+
+
+def _kw_matches_tweet(kw: str, tweet: dict) -> bool:
+    """True if the keyword appears in the tweet's hashtag list or body text."""
+    needle = kw.lower().lstrip("#")
+    if needle in (h.lower() for h in tweet.get("hashtags", [])):
+        return True
+    return needle in tweet.get("text", "").lower()
+
+
+def _update_keyword_activity(tweet: dict) -> None:
+    """Update last-seen timestamp for every active keyword matched by this tweet."""
+    now = time.time()
+    for kw in _active_keywords:
+        if _kw_matches_tweet(kw, tweet):
+            _keyword_last_seen[kw] = now
+
+
+def _rotate_silent_keywords() -> bool:
+    """
+    Swap any keyword that has been silent for >= ROTATION_IDLE_SECS with the
+    next unused candidate from BACKUP_KEYWORDS.
+    Returns True if at least one rotation occurred (caller should reconnect).
+    """
+    global _backup_cursor
+    now     = time.time()
+    rotated = False
+
+    for i, kw in enumerate(_active_keywords):
+        idle_secs = now - _keyword_last_seen.get(kw, now)
+        if idle_secs < ROTATION_IDLE_SECS:
+            continue
+
+        # Walk the backup pool until we find a candidate not already active
+        tried = 0
+        while tried < len(BACKUP_KEYWORDS):
+            candidate = BACKUP_KEYWORDS[_backup_cursor % len(BACKUP_KEYWORDS)]
+            _backup_cursor += 1
+            if candidate not in _active_keywords:
+                _active_keywords[i] = candidate
+                _keyword_last_seen[candidate] = now
+                logger.warning(
+                    "ROTATION: '%s' silent %.0fs → swapped in '%s'  |  active=%s",
+                    kw, idle_secs, candidate, _active_keywords,
+                )
+                rotated = True
+                break
+            tried += 1
+
+    return rotated
 
 
 # ─── Kafka ────────────────────────────────────────────────────────────────────
@@ -102,6 +184,9 @@ def publish(producer: Producer, tweet: dict) -> None:
         return
     if tid:
         _recent_ids.append(tid)
+
+    # Track per-keyword activity for rotation logic
+    _update_keyword_activity(tweet)
 
     try:
         payload = json.dumps(tweet, ensure_ascii=False).encode("utf-8")
@@ -158,6 +243,9 @@ _POSITIVE = [
     "New PySpark feature makes windowed aggregations so elegant.",
     "Real-time pipelines with Kafka are delightful to build.",
     "Data engineering is the backbone of AI. Love this field!",
+    "Bitcoin just hit a new milestone — the future of finance is here! 🚀",
+    "The #AIRevolution is transforming every industry. Incredible times!",
+    "Breaking news covered live with AI analysis. Real journalism evolved!",
 ]
 _NEGATIVE = [
     "This API documentation is absolutely terrible. Waste of hours.",
@@ -170,6 +258,9 @@ _NEGATIVE = [
     "Deployment failed AGAIN. CI/CD pipeline is completely broken.",
     "Kafka consumer lag is out of control. Operations nightmare.",
     "Legacy code with zero documentation is killing my productivity.",
+    "Bitcoin crashing again. Another rough day for crypto investors.",
+    "AI hype is outpacing actual progress. Tired of the overblown claims.",
+    "Breaking news overload — too much noise, not enough signal.",
 ]
 _NEUTRAL = [
     "Just pushed a new commit. PR is open for review.",
@@ -182,6 +273,9 @@ _NEUTRAL = [
     "Migrating from Python 3.9 to 3.11. Updating type hints.",
     "Pipeline processed 50k events with zero errors today.",
     "Reviewing schema migration script before applying to prod.",
+    "Bitcoin trading volume is steady. Markets looking normal.",
+    "New AI paper published on arxiv. Adding it to the reading list.",
+    "BreakingNews feed running smoothly. No major incidents today.",
 ]
 _HASHTAG_POOLS = [
     ["python", "programming", "coding"],
@@ -190,6 +284,9 @@ _HASHTAG_POOLS = [
     ["tech", "software", "engineering"],
     ["cloud", "aws", "devops"],
     ["spark", "pyspark", "dataengineering"],
+    ["AIRevolution", "ai", "futuretech"],       # high-volume
+    ["Bitcoin", "crypto", "blockchain"],        # high-volume
+    ["BreakingNews", "news", "trending"],       # high-volume
 ]
 _AUTHORS = [
     "dev_sanjay", "data_nerd_42", "kafka_queen", "spark_wizard",
@@ -200,7 +297,7 @@ _AUTHORS = [
 
 
 def generate_mock_tweet() -> dict:
-    pool = random.choices(
+    pool     = random.choices(
         [_POSITIVE, _NEGATIVE, _NEUTRAL],
         weights=[0.45, 0.35, 0.20],
     )[0]
@@ -225,25 +322,39 @@ async def run_mock(producer: Producer, stop_event: asyncio.Event) -> None:
     _in_mock_mode = True
     interval = 1.0 / max(MOCK_RATE, 0.1)
     logger.warning("▶ MOCK MODE active — %.1f tweet(s)/sec", MOCK_RATE)
+    _init_keyword_timestamps()
     while not stop_event.is_set():
         publish(producer, generate_mock_tweet())
-        # Add small jitter to simulate realistic burst patterns
+        # Keep all keyword timestamps fresh in mock mode.
+        # Rotation is a live-mode feature: mock always generates data for every topic.
+        now = time.time()
+        for kw in _active_keywords:
+            _keyword_last_seen[kw] = now
         await asyncio.sleep(interval * random.uniform(0.5, 1.5))
 
 
 # ─── Live WebSocket coroutine ─────────────────────────────────────────────────
 async def run_live(producer: Producer) -> bool:
     """
-    Try to open a live WebSocket stream.
-    Returns True  if at least one tweet was received (healthy connection).
-    Returns False if connection failed or no data received.
+    Open a live WebSocket stream for _active_keywords.
+
+    Every ROTATION_CHECK_SECS (30 s) the connection checks which keywords have
+    gone silent for >= ROTATION_IDLE_SECS.  If any are found:
+      • They are swapped for the next backup candidate.
+      • _rotation_triggered is set so orchestrate() reconnects cleanly.
+      • This function returns False without incrementing the failure counter.
+
+    Returns True  — at least one tweet received (healthy).
+    Returns False — connection error, no data, or rotation triggered.
     """
-    global _live_fail_count, _in_mock_mode
+    global _live_fail_count, _in_mock_mode, _rotation_triggered
 
     if not TWITTER_API_KEY:
         return False
 
-    keywords_query = " OR ".join(kw.strip() for kw in SEARCH_KEYWORDS)
+    ROTATION_CHECK_SECS = 30.0
+
+    keywords_query = " OR ".join(kw.strip() for kw in _active_keywords)
     subscribe_msg  = json.dumps({"type": "subscribe",
                                  "query": keywords_query, "lang": "en"})
     received_any   = False
@@ -257,26 +368,50 @@ async def run_live(producer: Producer) -> bool:
             open_timeout=10,
         ) as ws:
             await ws.send(subscribe_msg)
-            logger.info("✔ LIVE MODE — tracking: %s", SEARCH_KEYWORDS)
+            logger.info("✔ LIVE MODE — tracking: %s", _active_keywords)
             _in_mock_mode    = False
             _live_fail_count = 0
+            _init_keyword_timestamps()   # seed all timestamps on fresh connect
 
-            async for message in ws:
+            last_rotation_check = time.time()
+
+            while True:
+                # Wait up to ROTATION_CHECK_SECS for the next message
+                remaining = ROTATION_CHECK_SECS - (time.time() - last_rotation_check)
                 try:
-                    data = json.loads(message)
-                    if data.get("type") == "tweet":
-                        tweet = normalize_live(data.get("data", {}))
-                        if tweet["text"]:
-                            publish(producer, tweet)
-                            received_any = True
-                    elif data.get("type") == "error":
-                        logger.error("API stream error: %s", data)
-                        if "rate limit" in str(data).lower():
-                            logger.warning("Rate limit hit — will fall back for 60s")
-                            await asyncio.sleep(60)
-                            return False
-                except json.JSONDecodeError:
-                    pass
+                    message = await asyncio.wait_for(
+                        ws.recv(), timeout=max(0.5, remaining)
+                    )
+                except asyncio.TimeoutError:
+                    message = None
+
+                if message is not None:
+                    try:
+                        data = json.loads(message)
+                        if data.get("type") == "tweet":
+                            tweet = normalize_live(data.get("data", {}))
+                            if tweet["text"]:
+                                publish(producer, tweet)
+                                received_any = True
+                        elif data.get("type") == "error":
+                            logger.error("API stream error: %s", data)
+                            if "rate limit" in str(data).lower():
+                                logger.warning("Rate limit hit — backing off 60 s")
+                                await asyncio.sleep(60)
+                                return False
+                    except json.JSONDecodeError:
+                        pass
+
+                # Rotation check every ~ROTATION_CHECK_SECS seconds
+                if time.time() - last_rotation_check >= ROTATION_CHECK_SECS:
+                    last_rotation_check = time.time()
+                    if _rotate_silent_keywords():
+                        _rotation_triggered = True
+                        logger.info(
+                            "Reconnecting with updated subscription: %s",
+                            _active_keywords,
+                        )
+                        return False
 
     except (websockets.ConnectionClosedError,
             websockets.InvalidHandshake,
@@ -289,7 +424,7 @@ async def run_live(producer: Producer) -> bool:
 
 # ─── Main orchestrator ────────────────────────────────────────────────────────
 async def orchestrate(producer: Producer) -> None:
-    global _live_fail_count, _in_mock_mode
+    global _live_fail_count, _in_mock_mode, _rotation_triggered
 
     stop_mock  = asyncio.Event()
     mock_task  = None
@@ -305,7 +440,7 @@ async def orchestrate(producer: Producer) -> None:
 
         if should_try_live:
             last_retry = now
-            # Pause mock so we don't double-publish during probe
+            # Pause mock so we don't double-publish during live probe
             if mock_task and not mock_task.done():
                 stop_mock.set()
                 await mock_task
@@ -313,6 +448,12 @@ async def orchestrate(producer: Producer) -> None:
                 mock_task = None
 
             success = await run_live(producer)
+
+            # Rotation reconnect — not a failure, just re-subscribe with new keywords
+            if _rotation_triggered:
+                _rotation_triggered = False
+                logger.info("Re-subscribing after rotation: %s", _active_keywords)
+                continue   # reconnect immediately; don't touch failure counter
 
             if success:
                 _live_fail_count = 0
@@ -342,14 +483,20 @@ async def orchestrate(producer: Producer) -> None:
 
 # ─── Entrypoint ───────────────────────────────────────────────────────────────
 def main() -> None:
+    global _active_keywords
+    _active_keywords = list(SEARCH_KEYWORDS)   # mutable copy; rotated at runtime
+    _init_keyword_timestamps()
+
     if not TWITTER_API_KEY:
         logger.warning(
             "TWITTER_API_KEY not set — starting in MOCK mode. "
             "Set the key in .env to enable live tweets."
         )
 
-    logger.info("Producer starting — topic=%s bootstrap=%s",
-                KAFKA_TOPIC, KAFKA_BOOTSTRAP_SERVERS)
+    logger.info(
+        "Producer starting — topic=%s bootstrap=%s keywords=%s backup_pool=%d",
+        KAFKA_TOPIC, KAFKA_BOOTSTRAP_SERVERS, _active_keywords, len(BACKUP_KEYWORDS),
+    )
     producer = build_kafka_producer()
     _write_heartbeat()
 
