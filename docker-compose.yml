@@ -9,6 +9,9 @@ services:
       ZOOKEEPER_TICK_TIME: 2000
     ports:
       - "2181:2181"
+    deploy:
+      resources:
+        limits: { memory: 512m, cpus: "0.5" }
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "2181"]
       interval: 10s
@@ -34,7 +37,12 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_LOG_RETENTION_HOURS: 48
+      # Limit log size to prevent disk exhaustion
+      KAFKA_LOG_RETENTION_BYTES: 536870912   # 512 MB
+    deploy:
+      resources:
+        limits: { memory: 1g, cpus: "1.0" }
     healthcheck:
       test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
       interval: 15s
@@ -42,7 +50,6 @@ services:
       retries: 10
 
   # ─── Kafka Topic Init ────────────────────────────────────────────────────────
-  # Runs once to create the 'tweets' topic, then exits cleanly.
   kafka-init:
     image: confluentinc/cp-kafka:7.6.0
     container_name: twitter_kafka_init
@@ -74,13 +81,16 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./database/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    deploy:
+      resources:
+        limits: { memory: 512m, cpus: "0.5" }
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sentiment_user} -d ${POSTGRES_DB:-sentiment_db}"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  # ─── pgAdmin (optional GUI) ──────────────────────────────────────────────────
+  # ─── pgAdmin ─────────────────────────────────────────────────────────────────
   pgadmin:
     image: dpage/pgadmin4:8
     container_name: twitter_pgadmin
@@ -96,8 +106,11 @@ services:
       - "5050:5050"
     volumes:
       - pgadmin_data:/var/lib/pgadmin
+    deploy:
+      resources:
+        limits: { memory: 256m, cpus: "0.3" }
 
-  # ─── Kafka UI (optional monitoring) ─────────────────────────────────────────
+  # ─── Kafka UI ────────────────────────────────────────────────────────────────
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: twitter_kafka_ui
@@ -111,8 +124,11 @@ services:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
       KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    deploy:
+      resources:
+        limits: { memory: 256m, cpus: "0.3" }
 
-  # ─── Producer ────────────────────────────────────────────────────────────────
+  # ─── Producer (with heartbeat healthcheck) ───────────────────────────────────
   producer:
     build:
       context: ./producer
@@ -122,12 +138,24 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-    env_file:
-      - .env
+    env_file: .env
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      HEARTBEAT_FILE: /tmp/producer.heartbeat
     volumes:
       - ./producer:/app
+      - producer_heartbeat:/tmp
+    deploy:
+      resources:
+        limits: { memory: 256m, cpus: "0.5" }
+    # Healthcheck: heartbeat file must be updated within 2 minutes
+    healthcheck:
+      test: ["CMD-SHELL",
+             "python3 -c \"import time,sys; age=time.time()-float(open('/tmp/producer.heartbeat').read()); sys.exit(0 if age<120 else 1)\" 2>/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
   # ─── PySpark Processor ───────────────────────────────────────────────────────
   processor:
@@ -141,19 +169,51 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
-    env_file:
-      - .env
+    env_file: .env
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       POSTGRES_HOST: postgres
     volumes:
       - ./processor:/app
-      - spark_jars:/root/.ivy2   # Cache downloaded Spark JARs across restarts
+      - spark_jars:/root/.ivy2
+    deploy:
+      resources:
+        limits: { memory: 2g, cpus: "2.0" }
+
+  # ─── Monitor (auto-restarts stale producer) ──────────────────────────────────
+  monitor:
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
+    container_name: twitter_monitor
+    restart: unless-stopped
+    depends_on:
+      - producer
+      - kafka
+      - postgres
+    env_file: .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      POSTGRES_HOST: postgres
+      HEARTBEAT_FILE: /tmp/producer.heartbeat
+      PRODUCER_CONTAINER: twitter_producer
+      CHECK_INTERVAL: "30"
+      HEARTBEAT_STALE_SECS: "120"
+    volumes:
+      - ./producer:/app
+      - producer_heartbeat:/tmp
+      # Mount Docker socket so monitor can restart containers
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: ["python", "monitor.py"]
+    deploy:
+      resources:
+        limits: { memory: 128m, cpus: "0.2" }
 
 volumes:
   postgres_data:
   pgadmin_data:
   spark_jars:
+  producer_heartbeat:   # shared between producer and monitor
 
 networks:
   default:

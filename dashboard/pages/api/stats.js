@@ -1,10 +1,11 @@
 /**
  * GET /api/stats
  *
- * Returns aggregated sentiment statistics:
- *   - Overall summary (total, counts, percentages)
- *   - Sentiment per minute (last N minutes)
- *   - Top hashtags (last 24h)
+ * Returns:
+ *   summary     — overall counts, percentages, avg lag
+ *   timeSeries  — per-minute buckets (last N minutes)
+ *   rolling     — rolling 5-min sentiment averages (latest window per sentiment)
+ *   hashtags    — top 20 hashtags (last 24h)
  */
 
 import { query } from "../../lib/db";
@@ -17,11 +18,9 @@ export default async function handler(req, res) {
   const minutes = Math.min(parseInt(req.query.minutes ?? "60", 10), 1440);
 
   try {
-    const [summary, timeSeries, hashtags] = await Promise.all([
-      // Overall summary
+    const [summary, timeSeries, rolling, hashtags] = await Promise.all([
       query(`SELECT * FROM v_sentiment_summary`),
 
-      // Per-minute buckets for the requested window
       query(
         `SELECT
            bucket,
@@ -36,12 +35,20 @@ export default async function handler(req, res) {
         [minutes]
       ),
 
-      // Top 20 hashtags
+      // Rolling 5-min averages — latest snapshot per sentiment
+      query(
+        `SELECT sentiment, tweet_count,
+                ROUND(avg_compound::NUMERIC, 4) AS avg_compound,
+                window_start, window_end, computed_at
+         FROM v_rolling_5min
+         ORDER BY sentiment`
+      ),
+
       query(
         `SELECT
            hashtag,
-           SUM(mention_count)          AS mention_count,
-           ROUND(AVG(avg_sentiment_score)::NUMERIC, 4) AS avg_score
+           SUM(mention_count)                              AS mention_count,
+           ROUND(AVG(avg_sentiment_score)::NUMERIC, 4)    AS avg_score
          FROM mv_top_hashtags
          GROUP BY hashtag
          ORDER BY mention_count DESC
@@ -51,8 +58,9 @@ export default async function handler(req, res) {
 
     res.setHeader("Cache-Control", "s-maxage=10, stale-while-revalidate=20");
     return res.status(200).json({
-      summary: summary[0] ?? {},
+      summary:    summary[0] ?? {},
       timeSeries,
+      rolling,
       hashtags,
     });
   } catch (err) {
