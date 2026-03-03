@@ -21,17 +21,19 @@ export default async function handler(req, res) {
     const [summary, timeSeries, rolling, hashtags] = await Promise.all([
       query(`SELECT * FROM v_sentiment_summary`),
 
+      // Direct query — no materialized view, always current
       query(
         `SELECT
-           bucket,
+           date_trunc('minute', processed_at)            AS bucket,
            sentiment,
-           tweet_count,
-           ROUND(avg_compound::NUMERIC, 4) AS avg_compound,
-           total_retweets,
-           total_likes
-         FROM mv_sentiment_per_minute
-         WHERE bucket >= NOW() - ($1 || ' minutes')::INTERVAL
-         ORDER BY bucket ASC, sentiment`,
+           COUNT(*)                                      AS tweet_count,
+           ROUND(AVG(compound_score)::NUMERIC, 4)        AS avg_compound,
+           SUM(retweet_count)                            AS total_retweets,
+           SUM(like_count)                               AS total_likes
+         FROM tweet_sentiments
+         WHERE processed_at >= NOW() - ($1 * INTERVAL '1 minute')
+         GROUP BY 1, 2
+         ORDER BY 1 ASC, 2`,
         [minutes]
       ),
 
@@ -44,19 +46,21 @@ export default async function handler(req, res) {
          ORDER BY sentiment`
       ),
 
+      // Direct query — no materialized view, always current
       query(
         `SELECT
-           hashtag,
-           SUM(mention_count)                              AS mention_count,
-           ROUND(AVG(avg_sentiment_score)::NUMERIC, 4)    AS avg_score
-         FROM mv_top_hashtags
-         GROUP BY hashtag
-         ORDER BY mention_count DESC
+           unnest(hashtags)                              AS hashtag,
+           COUNT(*)                                      AS mention_count,
+           ROUND(AVG(compound_score)::NUMERIC, 4)        AS avg_score
+         FROM tweet_sentiments
+         WHERE processed_at >= NOW() - INTERVAL '24 hours'
+         GROUP BY 1
+         ORDER BY 2 DESC
          LIMIT 20`
       ),
     ]);
 
-    res.setHeader("Cache-Control", "s-maxage=10, stale-while-revalidate=20");
+    res.setHeader("Cache-Control", "s-maxage=5, stale-while-revalidate=5");
     return res.status(200).json({
       summary:    summary[0] ?? {},
       timeSeries,
