@@ -4,7 +4,7 @@ const nextConfig = {
   // pg is Node.js-only; mark it external so Next.js 14 doesn't try to bundle it.
   // (In Next.js 15+ this key moves to top-level `serverExternalPackages`)
   experimental: {
-    serverComponentsExternalPackages: ["pg"],
+    serverComponentsExternalPackages: ["pg", "agent-twitter-client"],
   },
 };
 
