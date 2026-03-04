@@ -1,11 +1,13 @@
 /**
  * GET /api/sentiments
  *
- * Returns the most recent N tweets with sentiment scores.
- *
  * Query params:
- *   limit    — number of tweets (default 50, max 200)
- *   sentiment — filter by label: positive | negative | neutral
+ *   hashtags  — comma-separated tag names, with or without #  (e.g. "AIRevolution,Bitcoin")
+ *   sentiment — positive | negative | neutral
+ *   limit     — max rows returned (default 50, max 200)
+ *
+ * Response:
+ *   { data: [...tweets], count: N, summary: { total, positive, negative, neutral } }
  */
 
 import { query } from "../../lib/db";
@@ -16,43 +18,69 @@ export default async function handler(req, res) {
   }
 
   const limit = Math.min(parseInt(req.query.limit ?? "50", 10), 200);
-  const sentiment = req.query.sentiment;
 
+  // Parse sentiment filter
+  const sentiment = req.query.sentiment ?? null;
   const validSentiments = ["positive", "negative", "neutral"];
   if (sentiment && !validSentiments.includes(sentiment)) {
     return res.status(400).json({ error: "Invalid sentiment filter" });
   }
 
-  try {
-    let sql = `
-      SELECT
-        tweet_id,
-        text,
-        author,
-        author_followers,
-        hashtags,
-        compound_score,
-        sentiment,
-        retweet_count,
-        like_count,
-        processed_at
-      FROM tweet_sentiments
-    `;
-    const params = [];
+  // Parse hashtag filter — strip leading # from each tag
+  const hashtagsRaw = req.query.hashtags ?? "";
+  const hashtags = hashtagsRaw
+    .split(",")
+    .map((h) => h.trim().replace(/^#/, ""))
+    .filter(Boolean);
 
+  try {
+    // ── Build WHERE clause ────────────────────────────────────────────────────
+    const params = [];
+    const conditions = [];
+
+    if (hashtags.length > 0) {
+      params.push(hashtags);
+      conditions.push(`hashtags && $${params.length}::text[]`);
+    }
     if (sentiment) {
-      sql += ` WHERE sentiment = $1`;
       params.push(sentiment);
+      conditions.push(`sentiment = $${params.length}`);
     }
 
-    sql += ` ORDER BY processed_at DESC LIMIT $${params.length + 1}`;
-    params.push(limit);
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
 
-    const rows = await query(sql, params);
+    // ── Fetch tweets ──────────────────────────────────────────────────────────
+    const tweetParams = [...params, limit];
+    const tweetSql = `
+      SELECT
+        tweet_id, text, author, author_followers,
+        hashtags, compound_score, sentiment,
+        retweet_count, like_count, processed_at
+      FROM tweet_sentiments
+      ${where}
+      ORDER BY processed_at DESC
+      LIMIT $${tweetParams.length}
+    `;
+    const rows = await query(tweetSql, tweetParams);
 
-    // Cache for 5 seconds — fresh enough for near-real-time, avoids DB hammering
-    res.setHeader("Cache-Control", "s-maxage=5, stale-while-revalidate=10");
-    return res.status(200).json({ data: rows, count: rows.length });
+    // ── Fetch summary counts (for the same filter, no LIMIT) ──────────────────
+    const countSql = `
+      SELECT sentiment, COUNT(*) AS cnt
+      FROM tweet_sentiments
+      ${where}
+      GROUP BY sentiment
+    `;
+    const counts = await query(countSql, params);
+
+    const summary = { total: 0, positive: 0, negative: 0, neutral: 0 };
+    counts.forEach((r) => {
+      const n = parseInt(r.cnt, 10);
+      summary[r.sentiment] = n;
+      summary.total += n;
+    });
+
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(200).json({ data: rows, count: rows.length, summary });
   } catch (err) {
     console.error("[/api/sentiments] error:", err.message);
     return res.status(500).json({ error: "Database query failed" });
