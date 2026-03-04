@@ -2,12 +2,12 @@
  * pages/index.js — Hashtag sentiment search dashboard.
  *
  * User flow:
- *   1. Type one or more hashtags in the search box (e.g. "AIRevolution, Bitcoin")
+ *   1. Type one or more hashtags (e.g. "AIRevolution, Bitcoin")
  *   2. Optionally pick a sentiment pill (All / Positive / Negative / Neutral)
  *   3. Hit Enter or click Search
- *   4. See matching tweets + live sentiment breakdown
- *
- * No continuous producer required — queries the existing Neon DB on demand.
+ *   4. /api/search fetches LIVE tweets from TwitterAPI.io (or generates topical
+ *      mock tweets if no API key), scores them with VADER, saves to Neon,
+ *      then returns the full matching set from the DB.
  */
 
 import { useState, useRef } from "react";
@@ -66,10 +66,18 @@ function TweetCard({ tweet }) {
         ))}
       </div>
 
-      <div style={{ color: "#475569", fontSize: "0.72rem", display: "flex", gap: "1rem" }}>
+      <div style={{ color: "#475569", fontSize: "0.72rem", display: "flex", gap: "1rem", alignItems: "center" }}>
         <span>🔁 {tweet.retweet_count}</span>
         <span>❤️ {tweet.like_count}</span>
         <span>{time}</span>
+        {tweet.source && (
+          <span style={{
+            marginLeft: "auto", fontSize: "0.65rem", padding: "1px 7px",
+            borderRadius: "999px", background: "#0f172a", border: "1px solid #334155", color: "#475569",
+          }}>
+            {tweet.source === "twitterapi.io" ? "LIVE" : tweet.source.toUpperCase()}
+          </span>
+        )}
       </div>
     </div>
   );
@@ -113,6 +121,7 @@ export default function Dashboard() {
   const [filter,       setFilter]       = useState("all");
   const [tweets,       setTweets]       = useState([]);
   const [summary,      setSummary]      = useState(null);
+  const [source,       setSource]       = useState(null);   // "live" | "mock" | "db"
   const [loading,      setLoading]      = useState(false);
   const [error,        setError]        = useState(null);
   const [searched,     setSearched]     = useState(false);
@@ -126,16 +135,19 @@ export default function Dashboard() {
     setSearched(true);
     setActiveQuery(tags || "all tweets");
 
+    if (!tags) return setLoading(false);   // hashtag required for live search
+
     const params = new URLSearchParams({ limit: "100" });
-    if (tags) params.set("hashtags", tags);
+    params.set("hashtags", tags);
     if (sentimentFilter !== "all") params.set("sentiment", sentimentFilter);
 
     try {
-      const res  = await fetch(`/api/sentiments?${params}`);
+      const res  = await fetch(`/api/search?${params}`);
       if (!res.ok) throw new Error(`API error ${res.status}`);
       const json = await res.json();
       setTweets(json.data ?? []);
       setSummary(json.summary ?? null);
+      setSource(json.source ?? "db");
     } catch (e) {
       setError(e.message);
     } finally {
@@ -248,13 +260,30 @@ export default function Dashboard() {
         {searched && (
           <>
             {/* Results header */}
-            <div style={{ marginBottom: "1rem", color: "#64748b", fontSize: "0.85rem" }}>
-              {loading ? "Searching…" : (
-                <>
-                  <span style={{ color: "#93c5fd", fontWeight: 700 }}>{summary?.total ?? tweets.length}</span> tweets matched
-                  {activeQuery !== "all tweets" && <> for <span style={{ color: "#fcd34d" }}>"{activeQuery}"</span></>}
-                  {filter !== "all" && <> · filtered to <span style={{ color: SENTIMENT_COLORS[filter]?.text }}>{filter}</span></>}
-                </>
+            <div style={{ marginBottom: "1rem", display: "flex", alignItems: "center", gap: "0.75rem", flexWrap: "wrap" }}>
+              <span style={{ color: "#64748b", fontSize: "0.85rem" }}>
+                {loading ? "Fetching tweets…" : (
+                  <>
+                    <span style={{ color: "#93c5fd", fontWeight: 700 }}>{summary?.total ?? tweets.length}</span> tweets for{" "}
+                    <span style={{ color: "#fcd34d" }}>"{activeQuery}"</span>
+                    {filter !== "all" && <> · <span style={{ color: SENTIMENT_COLORS[filter]?.text }}>{filter} only</span></>}
+                  </>
+                )}
+              </span>
+
+              {/* Source badge */}
+              {!loading && source && (
+                <span style={{
+                  fontSize: "0.7rem", fontWeight: 700, padding: "2px 10px",
+                  borderRadius: "999px", textTransform: "uppercase",
+                  ...(source === "live"
+                    ? { background: "#14532d", border: "1px solid #22c55e", color: "#86efac" }
+                    : source === "mock"
+                    ? { background: "#1e3a5f", border: "1px solid #6366f1", color: "#a5b4fc" }
+                    : { background: "#1c1917", border: "1px solid #78716c", color: "#a8a29e" }),
+                }}>
+                  {source === "live" ? "● LIVE" : source === "mock" ? "◎ MOCK" : "◉ DB"}
+                </span>
               )}
             </div>
 
