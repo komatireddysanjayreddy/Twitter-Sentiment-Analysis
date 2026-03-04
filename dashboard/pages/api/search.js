@@ -1,14 +1,11 @@
 /**
  * GET /api/search
  *
- * Fetches tweets for one or more hashtags, scores them with VADER,
- * upserts into Neon, and returns the full matching set.
- *
  * Source priority:
- *   1. TwitterAPI.io REST    — if TWITTER_API_KEY is configured
- *   2. agent-twitter-client  — if TWITTER_USERNAME + TWITTER_PASSWORD are set
- *                              (logs into your own Twitter account; free)
- *   3. Topic-aware mock      — always-available fallback
+ *   1. TwitterAPI.io REST          — if TWITTER_API_KEY is set
+ *   2. Cookie-based Twitter scrape — if TWITTER_AUTH_TOKEN + TWITTER_CT0 set
+ *      (extract from browser: x.com → F12 → Application → Cookies)
+ *   3. Topic-aware mock            — always-available fallback
  *
  * Query params:
  *   hashtags  — comma-separated tag names (required)
@@ -16,7 +13,7 @@
  *   limit     — max rows returned (default 50, max 200)
  *
  * Response: { data, count, summary, source }
- *   source = "live" | "twitter" | "mock" | "db"
+ *   source = "live" | "twitter" | "mock"
  */
 
 import { v4 as uuidv4 } from "uuid";
@@ -24,9 +21,9 @@ import Vader            from "vader-sentiment";
 import { query as db }  from "../../lib/db";
 
 // ── Env ───────────────────────────────────────────────────────────────────────
-const TWITTER_API_KEY    = process.env.TWITTER_API_KEY    ?? "";
-const TWITTER_USERNAME   = process.env.TWITTER_USERNAME   ?? "";
-const TWITTER_PASSWORD   = process.env.TWITTER_PASSWORD   ?? "";
+const TWITTER_API_KEY   = process.env.TWITTER_API_KEY   ?? "";
+const TWITTER_AUTH_TOKEN = process.env.TWITTER_AUTH_TOKEN ?? "";
+const TWITTER_CT0        = process.env.TWITTER_CT0        ?? "";
 const TWITTERAPI_SEARCH  = "https://api.twitterapi.io/twitter/tweet/advanced_search";
 
 // ── VADER scoring ─────────────────────────────────────────────────────────────
@@ -72,37 +69,43 @@ async function fetchViaTwitterApiIo(hashtags) {
   });
 }
 
-// ── Source 2: agent-twitter-client (your own Twitter account) ─────────────────
-// Module-level scraper cache — reused across warm Lambda invocations
+// ── Source 2: cookie-based scraping ──────────────────────────────────────────
+// Module-level scraper cache (reused across warm Lambda invocations)
 let _scraper       = null;
 let _scraperExpiry = 0;
-const SCRAPER_TTL  = 8 * 60 * 1000; // 8 minutes
+const SCRAPER_TTL  = 20 * 60 * 1000; // 20 min
 
 async function getAuthScraper() {
-  const { Scraper, SearchMode } = await import("agent-twitter-client");
+  const { Scraper, SearchMode } = await import("@the-convocation/twitter-scraper");
 
   if (_scraper && Date.now() < _scraperExpiry) {
     try {
-      const ok = await _scraper.isLoggedIn();
-      if (ok) return { scraper: _scraper, SearchMode };
-    } catch (_) { /* fall through to re-login */ }
+      if (await _scraper.isLoggedIn()) return { scraper: _scraper, SearchMode };
+    } catch (_) { /* fall through */ }
   }
 
   const scraper = new Scraper();
-  await scraper.login(TWITTER_USERNAME, TWITTER_PASSWORD);
+  await scraper.setCookies([
+    `auth_token=${TWITTER_AUTH_TOKEN}; Domain=.twitter.com; Path=/`,
+    `ct0=${TWITTER_CT0}; Domain=.twitter.com; Path=/`,
+  ]);
+
+  const ok = await scraper.isLoggedIn();
+  if (!ok) throw new Error("Twitter cookies are invalid or expired");
+
   _scraper       = scraper;
   _scraperExpiry = Date.now() + SCRAPER_TTL;
   return { scraper, SearchMode };
 }
 
-async function fetchViaScraping(hashtags) {
+async function fetchViaCookies(hashtags) {
   const { scraper, SearchMode } = await getAuthScraper();
 
+  // ANY hashtag works — no hardcoded list
   const q      = hashtags.map((h) => `#${h}`).join(" OR ") + " lang:en -is:retweet";
   const tweets = [];
 
-  const gen = scraper.searchTweets(q, 25, SearchMode.Latest);
-  for await (const t of gen) {
+  for await (const t of scraper.searchTweets(q, 25, SearchMode.Latest)) {
     if (tweets.length >= 25) break;
     const { compound, sentiment } = scoreText(t.text ?? "");
     tweets.push({
@@ -139,36 +142,27 @@ const MOCK_TEMPLATES = {
   default:         ["Really enjoying the conversation around this topic today.", "Mixed feelings about this — need more data to decide.", "This trend is fascinating to watch unfold in real time.", "Strong opinions on this. Hard to stay neutral.", "Interesting developments in this space lately.", "The community response to this has been massive.", "Worth keeping an eye on how this evolves.", "Data tells a different story than the headlines suggest."],
 };
 
+const MOCK_AUTHORS = ["dev_sanjay","data_nerd_42","kafka_queen","spark_wizard","ml_enthusiast","cloud_architect","crypto_watcher","ai_tracker","pipeline_pro","realtime_data","bytes_and_bits","infra_ninja","tech_observer","market_watcher","code_monkey_99","deep_learner"];
+
 function getMockTemplates(hashtags) {
   const key = hashtags.map((h) => h.toLowerCase()).find((h) => MOCK_TEMPLATES[h]);
   return MOCK_TEMPLATES[key] ?? MOCK_TEMPLATES.default;
 }
 
-const MOCK_AUTHORS = [
-  "dev_sanjay", "data_nerd_42", "kafka_queen", "spark_wizard",
-  "ml_enthusiast", "cloud_architect", "crypto_watcher", "ai_tracker",
-  "pipeline_pro", "realtime_data", "bytes_and_bits", "infra_ninja",
-  "tech_observer", "market_watcher", "code_monkey_99", "deep_learner",
-];
-
 function generateMockTweets(hashtags, count = 20) {
   const templates = getMockTemplates(hashtags);
   const tweets    = [];
-
   for (let i = 0; i < count; i++) {
     const base   = templates[i % templates.length];
     const suffix = i >= templates.length ? ` #${hashtags[Math.floor(Math.random() * hashtags.length)]}` : "";
-    const text   = base + suffix;
-    const { compound, sentiment } = scoreText(text);
-    const jitterMs = Math.floor(Math.random() * 300_000);
-
+    const { compound, sentiment } = scoreText(base + suffix);
     tweets.push({
       tweet_id:         uuidv4(),
-      text,
+      text:             base + suffix,
       author:           MOCK_AUTHORS[Math.floor(Math.random() * MOCK_AUTHORS.length)],
       author_followers: Math.floor(Math.random() * 50_000) + 100,
       lang:             "en",
-      tweet_created_at: new Date(Date.now() - jitterMs).toISOString(),
+      tweet_created_at: new Date(Date.now() - Math.floor(Math.random() * 300_000)).toISOString(),
       hashtags:         [...hashtags, "trending"].slice(0, 3),
       hashtag_count:    Math.min(hashtags.length + 1, 3),
       retweet_count:    Math.floor(Math.random() * 500),
@@ -178,7 +172,6 @@ function generateMockTweets(hashtags, count = 20) {
       source:           "mock",
     });
   }
-
   return tweets;
 }
 
@@ -188,8 +181,7 @@ const UPSERT_SQL = `
     (tweet_id, text, author, author_followers, lang, tweet_created_at,
      hashtags, hashtag_count, retweet_count, like_count,
      compound_score, sentiment, source)
-  VALUES
-    ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
   ON CONFLICT (tweet_id) DO NOTHING
 `;
 
@@ -203,7 +195,6 @@ async function upsertTweets(tweets) {
   }
 }
 
-// ── Summary helper ────────────────────────────────────────────────────────────
 function buildSummary(rows) {
   const s = { total: rows.length, positive: 0, negative: 0, neutral: 0 };
   rows.forEach((r) => { s[r.sentiment] = (s[r.sentiment] ?? 0) + 1; });
@@ -212,50 +203,34 @@ function buildSummary(rows) {
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 export default async function handler(req, res) {
-  if (req.method !== "GET") {
-    return res.status(405).json({ error: "Method not allowed" });
-  }
+  if (req.method !== "GET") return res.status(405).json({ error: "Method not allowed" });
 
   const hashtagsRaw = req.query.hashtags ?? "";
-  const hashtags = hashtagsRaw
-    .split(",")
-    .map((h) => h.trim().replace(/^#/, ""))
-    .filter(Boolean);
-
-  if (hashtags.length === 0) {
-    return res.status(400).json({ error: "At least one hashtag is required" });
-  }
+  const hashtags = hashtagsRaw.split(",").map((h) => h.trim().replace(/^#/, "")).filter(Boolean);
+  if (hashtags.length === 0) return res.status(400).json({ error: "At least one hashtag is required" });
 
   const sentiment = req.query.sentiment ?? null;
   const limit     = Math.min(parseInt(req.query.limit ?? "50", 10), 200);
   const validSentiments = ["positive", "negative", "neutral"];
-  if (sentiment && !validSentiments.includes(sentiment)) {
-    return res.status(400).json({ error: "Invalid sentiment filter" });
-  }
+  if (sentiment && !validSentiments.includes(sentiment)) return res.status(400).json({ error: "Invalid sentiment filter" });
 
   let freshTweets = [];
   let source      = "db";
 
   // ── Step 1: fetch fresh tweets ────────────────────────────────────────────
-  const hasIoKey = TWITTER_API_KEY.length > 10 && !TWITTER_API_KEY.includes("your_");
-  const hasCreds = Boolean(TWITTER_USERNAME && TWITTER_PASSWORD);
+  const hasIoKey     = TWITTER_API_KEY.length > 10 && !TWITTER_API_KEY.includes("your_");
+  const hasCookies   = Boolean(TWITTER_AUTH_TOKEN && TWITTER_CT0);
 
   if (hasIoKey) {
-    try {
-      freshTweets = await fetchViaTwitterApiIo(hashtags);
-      source      = "live";
-    } catch (err) {
-      console.warn("[/api/search] TwitterAPI.io failed:", err.message);
-    }
+    try { freshTweets = await fetchViaTwitterApiIo(hashtags); source = "live"; }
+    catch (err) { console.warn("[search] TwitterAPI.io failed:", err.message); }
   }
 
-  if (freshTweets.length === 0 && hasCreds) {
-    try {
-      freshTweets = await fetchViaScraping(hashtags);
-      source      = "twitter";
-    } catch (err) {
-      console.warn("[/api/search] Twitter scraping failed:", err.message);
-      _scraper = null; // reset so next request re-authenticates
+  if (freshTweets.length === 0 && hasCookies) {
+    try { freshTweets = await fetchViaCookies(hashtags); source = "twitter"; }
+    catch (err) {
+      console.warn("[search] Cookie scraping failed:", err.message);
+      _scraper = null;
     }
   }
 
@@ -264,24 +239,17 @@ export default async function handler(req, res) {
     source      = "mock";
   }
 
-  // ── Step 2: upsert fresh tweets ───────────────────────────────────────────
-  try {
-    await upsertTweets(freshTweets);
-  } catch (err) {
-    console.error("[/api/search] DB upsert failed:", err.message);
-  }
+  // ── Step 2: upsert ────────────────────────────────────────────────────────
+  try { await upsertTweets(freshTweets); }
+  catch (err) { console.error("[search] DB upsert failed:", err.message); }
 
-  // ── Step 3: query full result set from DB ─────────────────────────────────
+  // ── Step 3: query DB ──────────────────────────────────────────────────────
   try {
     const params     = [hashtags];
     const conditions = [`hashtags && $1::text[]`];
-
-    if (sentiment) {
-      params.push(sentiment);
-      conditions.push(`sentiment = $${params.length}`);
-    }
-
+    if (sentiment) { params.push(sentiment); conditions.push(`sentiment = $${params.length}`); }
     params.push(limit);
+
     const rows = await db(
       `SELECT tweet_id, text, author, author_followers, hashtags,
               compound_score, sentiment, retweet_count, like_count,
@@ -294,32 +262,20 @@ export default async function handler(req, res) {
     );
 
     const countRows = await db(
-      `SELECT sentiment, COUNT(*) AS cnt
-       FROM tweet_sentiments
+      `SELECT sentiment, COUNT(*) AS cnt FROM tweet_sentiments
        WHERE hashtags && $1::text[]
        ${sentiment ? "AND sentiment = $2" : ""}
        GROUP BY sentiment`,
       sentiment ? [hashtags, sentiment] : [hashtags],
     );
     const summary = { total: 0, positive: 0, negative: 0, neutral: 0 };
-    countRows.forEach((r) => {
-      const n = parseInt(r.cnt, 10);
-      summary[r.sentiment] = n;
-      summary.total += n;
-    });
+    countRows.forEach((r) => { const n = parseInt(r.cnt, 10); summary[r.sentiment] = n; summary.total += n; });
 
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({ data: rows, count: rows.length, summary, source });
   } catch (err) {
-    console.error("[/api/search] DB query failed:", err.message);
-    const filtered = sentiment
-      ? freshTweets.filter((t) => t.sentiment === sentiment)
-      : freshTweets;
-    return res.status(200).json({
-      data:    filtered.slice(0, limit),
-      count:   filtered.length,
-      summary: buildSummary(freshTweets),
-      source,
-    });
+    console.error("[search] DB query failed:", err.message);
+    const filtered = sentiment ? freshTweets.filter((t) => t.sentiment === sentiment) : freshTweets;
+    return res.status(200).json({ data: filtered.slice(0, limit), count: filtered.length, summary: buildSummary(freshTweets), source });
   }
 }
