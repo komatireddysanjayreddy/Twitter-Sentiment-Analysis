@@ -1,22 +1,29 @@
 /**
- * pages/index.js — Hashtag sentiment search dashboard.
+ * pages/index.js — Hashtag sentiment search dashboard with live streaming.
  *
  * User flow:
  *   1. Type one or more hashtags (e.g. "AIRevolution, Bitcoin")
  *   2. Optionally pick a sentiment pill (All / Positive / Negative / Neutral)
  *   3. Hit Enter or click Search
- *   4. /api/search fetches LIVE tweets from TwitterAPI.io (or generates topical
- *      mock tweets if no API key), scores them with VADER, saves to Neon,
- *      then returns the full matching set from the DB.
+ *   4. /api/search fetches LIVE tweets from TwitterAPI.io (or topical mock),
+ *      scores with VADER, saves to Neon, returns the full matching set.
+ *   5. While the page is open, polls every 5 s for new tweets and updates
+ *      the sentiment trend chart in real time.
  */
 
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import Head from "next/head";
+import {
+  AreaChart, Area, XAxis, YAxis, CartesianGrid,
+  Tooltip, Legend, ResponsiveContainer,
+} from "recharts";
+
+const POLL_INTERVAL = 5000; // ms between live-poll requests
 
 const SENTIMENT_COLORS = {
-  positive: { bg: "#14532d", border: "#22c55e", text: "#86efac", dot: "#22c55e" },
-  negative: { bg: "#7f1d1d", border: "#ef4444", text: "#fca5a5", dot: "#ef4444" },
-  neutral:  { bg: "#1c1917", border: "#f59e0b", text: "#fcd34d", dot: "#f59e0b" },
+  positive: { bg: "#14532d", border: "#22c55e", text: "#86efac", dot: "#22c55e", chart: "#22c55e" },
+  negative: { bg: "#7f1d1d", border: "#ef4444", text: "#fca5a5", dot: "#ef4444", chart: "#ef4444" },
+  neutral:  { bg: "#1c1917", border: "#f59e0b", text: "#fcd34d", dot: "#f59e0b", chart: "#f59e0b" },
 };
 
 const SUGGESTED_TAGS = [
@@ -24,8 +31,26 @@ const SUGGESTED_TAGS = [
   "crypto", "machinelearning", "spark", "devops", "tech",
 ];
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function bucketKey(isoDate) {
+  // "HH:MM" bucket from ISO timestamp
+  const d = new Date(isoDate);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+function buildChartData(tweets) {
+  // Aggregate tweet counts by minute-bucket and sentiment
+  const map = {};
+  for (const t of tweets) {
+    const key = bucketKey(t.processed_at || new Date().toISOString());
+    if (!map[key]) map[key] = { time: key, positive: 0, negative: 0, neutral: 0 };
+    map[key][t.sentiment] = (map[key][t.sentiment] || 0) + 1;
+  }
+  return Object.values(map).sort((a, b) => a.time.localeCompare(b.time));
+}
+
 // ── Tweet card ────────────────────────────────────────────────────────────────
-function TweetCard({ tweet }) {
+function TweetCard({ tweet, isNew }) {
   const c = SENTIMENT_COLORS[tweet.sentiment] ?? SENTIMENT_COLORS.neutral;
   const score = Number(tweet.compound_score ?? 0).toFixed(3);
   const time = new Date(tweet.processed_at).toLocaleString();
@@ -38,6 +63,8 @@ function TweetCard({ tweet }) {
       borderRadius: "8px",
       padding: "1rem 1.25rem",
       marginBottom: "0.75rem",
+      transition: "opacity 0.4s",
+      animation: isNew ? "fadeIn 0.5s ease" : "none",
     }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "0.5rem", marginBottom: "0.5rem" }}>
         <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
@@ -115,27 +142,116 @@ function SummaryBar({ summary, loading }) {
   );
 }
 
+// ── Sentiment trend chart ─────────────────────────────────────────────────────
+function SentimentChart({ chartData, isLive }) {
+  if (!chartData || chartData.length === 0) return null;
+
+  return (
+    <div style={{
+      background: "#1e293b",
+      border: "1px solid #334155",
+      borderRadius: "12px",
+      padding: "1.25rem",
+      marginBottom: "1.5rem",
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "0.6rem", marginBottom: "1rem" }}>
+        <span style={{ color: "#94a3b8", fontSize: "0.75rem", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+          Sentiment Trend
+        </span>
+        {isLive && (
+          <span style={{
+            display: "flex", alignItems: "center", gap: "0.3rem",
+            fontSize: "0.65rem", fontWeight: 700, color: "#86efac",
+            background: "#14532d", border: "1px solid #22c55e",
+            borderRadius: "999px", padding: "1px 8px",
+          }}>
+            <span style={{
+              width: "6px", height: "6px", borderRadius: "50%",
+              background: "#22c55e", display: "inline-block",
+              animation: "pulse 1.5s infinite",
+            }} />
+            LIVE
+          </span>
+        )}
+        <span style={{ marginLeft: "auto", color: "#475569", fontSize: "0.7rem" }}>tweets per minute</span>
+      </div>
+
+      <ResponsiveContainer width="100%" height={200}>
+        <AreaChart data={chartData} margin={{ top: 5, right: 10, left: -20, bottom: 0 }}>
+          <defs>
+            <linearGradient id="posGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor="#22c55e" stopOpacity={0.3} />
+              <stop offset="95%" stopColor="#22c55e" stopOpacity={0} />
+            </linearGradient>
+            <linearGradient id="negGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor="#ef4444" stopOpacity={0.3} />
+              <stop offset="95%" stopColor="#ef4444" stopOpacity={0} />
+            </linearGradient>
+            <linearGradient id="neuGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor="#f59e0b" stopOpacity={0.3} />
+              <stop offset="95%" stopColor="#f59e0b" stopOpacity={0} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid strokeDasharray="3 3" stroke="#1e3a5f" />
+          <XAxis dataKey="time" tick={{ fill: "#475569", fontSize: 11 }} tickLine={false} />
+          <YAxis tick={{ fill: "#475569", fontSize: 11 }} tickLine={false} axisLine={false} allowDecimals={false} />
+          <Tooltip
+            contentStyle={{ background: "#0f172a", border: "1px solid #334155", borderRadius: "6px", fontSize: "0.8rem" }}
+            labelStyle={{ color: "#94a3b8" }}
+          />
+          <Legend wrapperStyle={{ fontSize: "0.75rem", paddingTop: "0.5rem" }} />
+          <Area type="monotone" dataKey="positive" stroke="#22c55e" fill="url(#posGrad)" strokeWidth={2} dot={false} name="Positive" />
+          <Area type="monotone" dataKey="negative" stroke="#ef4444" fill="url(#negGrad)" strokeWidth={2} dot={false} name="Negative" />
+          <Area type="monotone" dataKey="neutral"  stroke="#f59e0b" fill="url(#neuGrad)" strokeWidth={2} dot={false} name="Neutral" />
+        </AreaChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 export default function Dashboard() {
-  const [inputValue,   setInputValue]   = useState("");
-  const [filter,       setFilter]       = useState("all");
-  const [tweets,       setTweets]       = useState([]);
-  const [summary,      setSummary]      = useState(null);
-  const [source,       setSource]       = useState(null);   // "live" | "mock" | "db"
-  const [loading,      setLoading]      = useState(false);
-  const [error,        setError]        = useState(null);
-  const [searched,     setSearched]     = useState(false);
-  const [activeQuery,  setActiveQuery]  = useState("");
-  const inputRef = useRef(null);
+  const [inputValue,  setInputValue]  = useState("");
+  const [filter,      setFilter]      = useState("all");
+  const [tweets,      setTweets]      = useState([]);
+  const [newTweetIds, setNewTweetIds] = useState(new Set());
+  const [seenIds,     setSeenIds]     = useState(new Set());
+  const [summary,     setSummary]     = useState(null);
+  const [source,      setSource]      = useState(null);
+  const [loading,     setLoading]     = useState(false);
+  const [error,       setError]       = useState(null);
+  const [searched,    setSearched]    = useState(false);
+  const [activeQuery, setActiveQuery] = useState("");
+  const [isLive,      setIsLive]      = useState(false);
+  const [chartData,   setChartData]   = useState([]);
+  const [pollCount,   setPollCount]   = useState(0);
 
-  const doSearch = async (hashtagStr, sentimentFilter) => {
+  const inputRef   = useRef(null);
+  const pollRef    = useRef(null);    // interval handle
+  const allTweets  = useRef([]);      // full accumulation across polls
+  const activeSeenIds = useRef(new Set());
+
+  // ── Stop polling ─────────────────────────────────────────────────────────
+  const stopPolling = useCallback(() => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+    setIsLive(false);
+  }, []);
+
+  // Cleanup on unmount
+  useEffect(() => () => stopPolling(), [stopPolling]);
+
+  // ── Single fetch ──────────────────────────────────────────────────────────
+  const fetchTweets = useCallback(async (hashtagStr, sentimentFilter, isInitial = false) => {
     const tags = hashtagStr.trim();
-    setLoading(true);
-    setError(null);
-    setSearched(true);
-    setActiveQuery(tags || "all tweets");
+    if (!tags) return;
 
-    if (!tags) return setLoading(false);   // hashtag required for live search
+    if (isInitial) {
+      setLoading(true);
+      setError(null);
+    }
 
     const params = new URLSearchParams({ limit: "100" });
     params.set("hashtags", tags);
@@ -145,15 +261,64 @@ export default function Dashboard() {
       const res  = await fetch(`/api/search?${params}`);
       if (!res.ok) throw new Error(`API error ${res.status}`);
       const json = await res.json();
-      setTweets(json.data ?? []);
-      setSummary(json.summary ?? null);
-      setSource(json.source ?? "db");
+
+      const incoming = json.data ?? [];
+      const freshOnes = incoming.filter((t) => !activeSeenIds.current.has(t.tweet_id));
+
+      if (freshOnes.length > 0 || isInitial) {
+        freshOnes.forEach((t) => activeSeenIds.current.add(t.tweet_id));
+
+        // Merge: prepend fresh tweets, keep accumulation sorted newest-first
+        allTweets.current = [
+          ...freshOnes,
+          ...allTweets.current.filter(
+            (t) => !freshOnes.some((f) => f.tweet_id === t.tweet_id)
+          ),
+        ].slice(0, 200);
+
+        setTweets([...allTweets.current]);
+        setNewTweetIds(new Set(freshOnes.map((t) => t.tweet_id)));
+        setSummary(json.summary ?? null);
+        setSource(json.source ?? "db");
+        setPollCount((c) => c + 1);
+
+        // Rebuild chart from full accumulation
+        setChartData(buildChartData(allTweets.current));
+      }
     } catch (e) {
-      setError(e.message);
+      if (isInitial) setError(e.message);
+      console.error("[poll]", e.message);
     } finally {
-      setLoading(false);
+      if (isInitial) setLoading(false);
     }
-  };
+  }, []);
+
+  // ── Start a search (resets everything) ───────────────────────────────────
+  const doSearch = useCallback(async (hashtagStr, sentimentFilter) => {
+    stopPolling();
+
+    const tags = hashtagStr.trim();
+    setSearched(true);
+    setActiveQuery(tags || "all tweets");
+    setTweets([]);
+    setSummary(null);
+    setChartData([]);
+    setPollCount(0);
+    allTweets.current = [];
+    activeSeenIds.current = new Set();
+
+    if (!tags) return;
+
+    // Initial fetch (shows loading spinner)
+    await fetchTweets(tags, sentimentFilter, true);
+    setIsLive(true);
+
+    // Start polling
+    pollRef.current = setInterval(
+      () => fetchTweets(tags, sentimentFilter, false),
+      POLL_INTERVAL
+    );
+  }, [fetchTweets, stopPolling]);
 
   const handleSearch = () => doSearch(inputValue, filter);
 
@@ -169,16 +334,21 @@ export default function Dashboard() {
   const handleSuggestedTag = (tag) => {
     const current = inputValue.split(",").map((t) => t.trim()).filter(Boolean);
     if (!current.includes(tag)) {
-      const next = [...current, tag].join(", ");
-      setInputValue(next);
+      setInputValue([...current, tag].join(", "));
     }
   };
+
+  const handleStop = () => stopPolling();
 
   return (
     <>
       <Head>
-        <title>Twitter Sentiment Search</title>
+        <title>Twitter Sentiment — Live</title>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <style>{`
+          @keyframes fadeIn { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
+          @keyframes pulse  { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+        `}</style>
       </Head>
 
       <div style={styles.page}>
@@ -186,7 +356,7 @@ export default function Dashboard() {
         <header style={styles.header}>
           <div>
             <h1 style={styles.title}>Twitter Sentiment Analysis</h1>
-            <p style={styles.subtitle}>Search tweets by hashtag · Kafka · PySpark · VADER · Neon PostgreSQL</p>
+            <p style={styles.subtitle}>Search hashtags · Live tweets · VADER · Neon PostgreSQL</p>
           </div>
         </header>
 
@@ -206,6 +376,11 @@ export default function Dashboard() {
             <button onClick={handleSearch} style={styles.searchBtn} disabled={loading}>
               {loading ? "Searching…" : "Search"}
             </button>
+            {isLive && (
+              <button onClick={handleStop} style={styles.stopBtn} title="Stop live updates">
+                ■ Stop
+              </button>
+            )}
           </div>
 
           {/* Suggested tags */}
@@ -240,23 +415,22 @@ export default function Dashboard() {
         </div>
 
         {/* ── Error ───────────────────────────────────────────────────────── */}
-        {error && (
-          <div style={styles.errorBanner}>⚠ {error}</div>
-        )}
+        {error && <div style={styles.errorBanner}>⚠ {error}</div>}
 
-        {/* ── Results area ────────────────────────────────────────────────── */}
+        {/* ── Empty state ─────────────────────────────────────────────────── */}
         {!searched && !loading && (
           <div style={styles.emptyState}>
             <div style={{ fontSize: "3rem", marginBottom: "1rem" }}>🔍</div>
             <div style={{ color: "#94a3b8", fontSize: "1.1rem" }}>
-              Enter a hashtag above and click <strong style={{ color: "#93c5fd" }}>Search</strong> to explore tweet sentiments.
+              Enter a hashtag above and click <strong style={{ color: "#93c5fd" }}>Search</strong> to explore tweet sentiments live.
             </div>
             <div style={{ color: "#475569", fontSize: "0.85rem", marginTop: "0.5rem" }}>
-              Try: #AIRevolution · #Bitcoin · #BreakingNews · #python
+              Tweets refresh every {POLL_INTERVAL / 1000}s while the page is open.
             </div>
           </div>
         )}
 
+        {/* ── Results area ────────────────────────────────────────────────── */}
         {searched && (
           <>
             {/* Results header */}
@@ -285,10 +459,30 @@ export default function Dashboard() {
                   {source === "live" ? "● LIVE" : source === "mock" ? "◎ MOCK" : "◉ DB"}
                 </span>
               )}
+
+              {/* Live indicator */}
+              {isLive && (
+                <span style={{
+                  display: "flex", alignItems: "center", gap: "0.3rem",
+                  fontSize: "0.7rem", fontWeight: 700, color: "#86efac",
+                  background: "#14532d", border: "1px solid #22c55e",
+                  borderRadius: "999px", padding: "2px 10px",
+                }}>
+                  <span style={{
+                    width: "6px", height: "6px", borderRadius: "50%",
+                    background: "#22c55e", display: "inline-block",
+                    animation: "pulse 1.5s infinite",
+                  }} />
+                  Streaming · poll #{pollCount}
+                </span>
+              )}
             </div>
 
             {/* Summary bar */}
             <SummaryBar summary={summary} loading={loading} />
+
+            {/* Live sentiment chart */}
+            <SentimentChart chartData={chartData} isLive={isLive} />
 
             {/* Tweet list */}
             {!loading && tweets.length === 0 && (
@@ -298,7 +492,9 @@ export default function Dashboard() {
               </div>
             )}
 
-            {!loading && tweets.map((t) => <TweetCard key={t.tweet_id} tweet={t} />)}
+            {tweets.map((t) => (
+              <TweetCard key={t.tweet_id} tweet={t} isNew={newTweetIds.has(t.tweet_id)} />
+            ))}
           </>
         )}
       </div>
@@ -317,15 +513,9 @@ const styles = {
     maxWidth: "900px",
     margin: "0 auto",
   },
-  header: {
-    marginBottom: "2rem",
-  },
-  title: {
-    fontSize: "1.75rem", fontWeight: 800, color: "#f1f5f9", margin: 0,
-  },
-  subtitle: {
-    color: "#475569", fontSize: "0.8rem", margin: "0.25rem 0 0",
-  },
+  header: { marginBottom: "2rem" },
+  title: { fontSize: "1.75rem", fontWeight: 800, color: "#f1f5f9", margin: 0 },
+  subtitle: { color: "#475569", fontSize: "0.8rem", margin: "0.25rem 0 0" },
   searchCard: {
     background: "#1e293b",
     borderRadius: "12px",
@@ -339,9 +529,7 @@ const styles = {
     textTransform: "uppercase", letterSpacing: "0.05em",
     marginBottom: "0.6rem",
   },
-  searchRow: {
-    display: "flex", gap: "0.75rem",
-  },
+  searchRow: { display: "flex", gap: "0.75rem" },
   searchInput: {
     flex: 1,
     background: "#0f172a",
@@ -360,6 +548,17 @@ const styles = {
     color: "#fff",
     fontWeight: 700,
     fontSize: "0.9rem",
+    cursor: "pointer",
+    whiteSpace: "nowrap",
+  },
+  stopBtn: {
+    background: "#7f1d1d",
+    border: "1px solid #ef4444",
+    borderRadius: "8px",
+    padding: "0.65rem 1rem",
+    color: "#fca5a5",
+    fontWeight: 700,
+    fontSize: "0.85rem",
     cursor: "pointer",
     whiteSpace: "nowrap",
   },
